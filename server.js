@@ -29,9 +29,17 @@ function withinRoot(p, root) {
   return p === root || p.startsWith(root + path.sep);
 }
 
+function looksLikeTraversalAttempt(requestedPath) {
+  if (/[\x00-\x1f]/.test(requestedPath)) return true; // null byte / control chars
+  if (requestedPath.includes("\\")) return true; // backslash is not a valid separator here
+  if (path.posix.isAbsolute(requestedPath)) return true; // absolute path attempt
+  const segments = requestedPath.split("/");
+  return segments.some((seg) => seg === "..");
+}
+
 function safeResolveWithinSandbox(requestedPath) {
   if (typeof requestedPath !== "string" || requestedPath.length === 0) return null;
-  if (requestedPath.includes("\0")) return null;
+  if (looksLikeTraversalAttempt(requestedPath)) return null;
 
   const resolved = path.resolve(SANDBOX_ROOT, requestedPath);
   if (!withinRoot(resolved, SANDBOX_ROOT)) return null;
@@ -105,6 +113,14 @@ function isDisallowedAddress(ip) {
 }
 
 function validateUrlPolicy(rawUrl) {
+  if (typeof rawUrl !== "string" || /[^\x00-\x7f]/.test(rawUrl)) {
+    // Reject non-ASCII input outright: IDNA/UTS46 host mapping can normalize
+    // fullwidth or other Unicode lookalike characters down to an exact match
+    // against an allowlisted hostname (e.g. fullwidth "example.com" -> "example.com"),
+    // which would otherwise bypass a naive exact-string allowlist check.
+    return { ok: false, reason: "non-ASCII characters are not permitted in URLs" };
+  }
+
   let u;
   try {
     u = new URL(rawUrl);

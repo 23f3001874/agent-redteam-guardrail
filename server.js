@@ -112,6 +112,58 @@ function isDisallowedAddress(ip) {
   return ip.includes(":") ? isPrivateIPv6(ip) : isPrivateIPv4(ip);
 }
 
+// Extracts a hostname-like candidate from a raw query-parameter value,
+// whether that value is a full URL, a scheme-relative URL, or a bare
+// host[:port][/path] reference with no scheme at all.
+function extractHostCandidate(value) {
+  try {
+    const asUrl = new URL(value);
+    return asUrl.hostname.toLowerCase();
+  } catch (e) {
+    // not a full URL -- fall through to bare host[:port][/path] parsing
+  }
+  const m = value.match(/^([^\s/?#]+)/);
+  if (!m) return null;
+  let hostPart = m[1];
+  const idx = hostPart.indexOf(":");
+  if (idx > 0) hostPart = hostPart.slice(0, idx);
+  return hostPart.toLowerCase();
+}
+
+// A query-parameter value can smuggle an SSRF target even when the request's
+// own host is allowlisted (e.g. example.com/redirect?next=169.254.169.254).
+// Only apply IP-range logic to things that are actually IP literals -- a
+// plain hostname or ordinary word must never be treated as an IP.
+function looksLikeInternalTarget(rawValue) {
+  if (typeof rawValue !== "string" || rawValue.length === 0) return false;
+  const value = rawValue.trim();
+
+  // A parameter carrying a full (or scheme-relative) URL at all is itself
+  // the classic redirect-smuggling signal, regardless of where it points.
+  if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//.test(value) || value.startsWith("//")) return true;
+
+  const host = extractHostCandidate(value);
+  if (!host) return false;
+
+  if (host === "localhost" || BLOCKED_HOSTNAME_LITERALS.has(host)) return true;
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return isPrivateIPv4(host);
+  if (host.includes(":")) return isPrivateIPv6(host);
+  return false;
+}
+
+function findSuspiciousQueryParam(rawUrl) {
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch (e) {
+    return null;
+  }
+  for (const [key, value] of u.searchParams.entries()) {
+    if (looksLikeInternalTarget(value)) return key;
+  }
+  return null;
+}
+
 function validateUrlPolicy(rawUrl) {
   if (typeof rawUrl !== "string" || /[^\x00-\x7f]/.test(rawUrl)) {
     // Reject non-ASCII input outright: IDNA/UTS46 host mapping can normalize
@@ -145,6 +197,11 @@ function validateUrlPolicy(rawUrl) {
   }
   if (!ALLOWED_HOSTS.has(hostname)) {
     return { ok: false, reason: `host not in allowlist: ${hostname}` };
+  }
+
+  const suspiciousParam = findSuspiciousQueryParam(rawUrl);
+  if (suspiciousParam) {
+    return { ok: false, reason: `query parameter "${suspiciousParam}" carries an internal/metadata/redirect target` };
   }
 
   return { ok: true, hostname };

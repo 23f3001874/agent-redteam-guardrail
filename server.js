@@ -69,8 +69,46 @@ function looksLikeTraversalAttempt(requestedPath) {
   return segments.some((seg) => seg === "..");
 }
 
-function safeResolveWithinSandbox(requestedPath) {
-  if (typeof requestedPath !== "string" || requestedPath.length === 0) return null;
+// The containment check must judge where the path actually resolves, not
+// whether the raw string contains "..". An encoded/obfuscated value that
+// DECODES to a traversal is just as dangerous as a literal one, so we
+// canonicalize first: repeatedly percent-decode (handles double-encoding),
+// Unicode NFKC-normalize (collapses fullwidth "．．／" lookalikes to ASCII
+// "../"), and unwrap a "base64:" prefix -- then re-run the same pipeline on
+// the result, since any of those steps can reveal another layer. Capped at a
+// few rounds so a pathological input can't loop forever.
+function normalizeForTraversalCheck(requestedPath) {
+  let current = requestedPath;
+  for (let i = 0; i < 5; i++) {
+    let next = current;
+    try {
+      next = next.normalize("NFKC");
+    } catch (e) {
+      // ignore -- keep pre-normalize value
+    }
+    try {
+      next = decodeURIComponent(next);
+    } catch (e) {
+      // malformed percent-encoding -- keep as-is
+    }
+    if (next.startsWith("base64:")) {
+      try {
+        const decoded = Buffer.from(next.slice(7), "base64").toString("utf8");
+        if (decoded) next = decoded;
+      } catch (e) {
+        // ignore -- keep as-is
+      }
+    }
+    if (next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+function safeResolveWithinSandbox(rawRequestedPath) {
+  if (typeof rawRequestedPath !== "string" || rawRequestedPath.length === 0) return null;
+  const requestedPath = normalizeForTraversalCheck(rawRequestedPath);
+  if (requestedPath.length === 0) return null;
   if (looksLikeTraversalAttempt(requestedPath)) return null;
 
   const resolved = path.resolve(SANDBOX_ROOT, requestedPath);

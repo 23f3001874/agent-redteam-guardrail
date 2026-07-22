@@ -118,7 +118,11 @@ function isDisallowedAddress(ip) {
 function extractHostCandidate(value) {
   try {
     const asUrl = new URL(value);
-    return asUrl.hostname.toLowerCase();
+    // A value like "localhost:8080" parses "successfully" as a URL with
+    // scheme "localhost:" and NO authority (empty hostname), since it has no
+    // "//". That's not really a URL parse -- fall through to bare-host
+    // parsing instead of treating it as host-less.
+    if (asUrl.hostname) return asUrl.hostname.toLowerCase();
   } catch (e) {
     // not a full URL -- fall through to bare host[:port][/path] parsing
   }

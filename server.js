@@ -142,16 +142,24 @@ function looksLikeInternalTarget(rawValue) {
   if (typeof rawValue !== "string" || rawValue.length === 0) return false;
   const value = rawValue.trim();
 
-  // A parameter carrying a full (or scheme-relative) URL at all is itself
-  // the classic redirect-smuggling signal, regardless of where it points.
-  if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//.test(value) || value.startsWith("//")) return true;
-
   const host = extractHostCandidate(value);
-  if (!host) return false;
 
-  if (host === "localhost" || BLOCKED_HOSTNAME_LITERALS.has(host)) return true;
-  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return isPrivateIPv4(host);
-  if (host.includes(":")) return isPrivateIPv6(host);
+  // A bare IP/localhost/metadata-literal target is dangerous regardless of
+  // whether it's wrapped in a full URL or given bare -- these never belong
+  // in a query parameter for this guardrail.
+  if (host) {
+    if (host === "localhost" || BLOCKED_HOSTNAME_LITERALS.has(host)) return true;
+    if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return isPrivateIPv4(host);
+    if (host.includes(":")) return isPrivateIPv6(host);
+  }
+
+  // A parameter carrying a full (or scheme-relative) URL is only suspicious
+  // when it points somewhere OTHER than an already-allowed host -- a nested
+  // reference to an allowed host (e.g. ?canonical=https://example.com/page)
+  // is not a real SSRF risk and must not be over-blocked.
+  const looksLikeUrl = /^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//.test(value) || value.startsWith("//");
+  if (looksLikeUrl && !(host && ALLOWED_HOSTS.has(host))) return true;
+
   return false;
 }
 

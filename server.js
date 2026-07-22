@@ -6,6 +6,38 @@ const dns = require("dns").promises;
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// ---------- diagnostic capture (best-effort; never affects the real decision) ----------
+
+const CAPTURE_KEY = "guardrail:captured";
+const CAPTURE_MAX = 100;
+
+async function redisCommand(cmd) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(cmd),
+    });
+    const json = await res.json();
+    if (json.error) return null;
+    return json.result;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function captureRequest(entry) {
+  try {
+    await redisCommand(["LPUSH", CAPTURE_KEY, JSON.stringify(entry)]);
+    await redisCommand(["LTRIM", CAPTURE_KEY, "0", String(CAPTURE_MAX - 1)]);
+  } catch (e) {
+    // ignore -- diagnostics must never affect the real response
+  }
+}
+
 const SANDBOX_ROOT = "/srv/agent-redteam/sandbox-769a5bfd96";
 let REAL_SANDBOX_ROOT;
 try {
@@ -163,6 +195,14 @@ function looksLikeInternalTarget(rawValue) {
   return false;
 }
 
+// Only these param names carry redirect/target semantics per the described
+// attack shape (?next=, ?redirect=, ?url=, ...). A bare IP/localhost-shaped
+// VALUE under an unrelated key (e.g. ?version=10.0.0.5, a version string that
+// happens to be numeric-quad-shaped) must not be treated as a target -- only
+// an actual wrapped URL (unambiguous regardless of key name) or a
+// redirect-sounding key name triggers the internal-target check.
+const REDIRECT_LIKE_PARAM_NAMES = /^(next|redirect|redirect_uri|redirect_url|url|target|dest|destination|forward|goto|return|return_to|return_url|callback|continue|out|to|link)$/i;
+
 function findSuspiciousQueryParam(rawUrl) {
   let u;
   try {
@@ -171,6 +211,9 @@ function findSuspiciousQueryParam(rawUrl) {
     return null;
   }
   for (const [key, value] of u.searchParams.entries()) {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    const isUrlShaped = /^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//.test(trimmed) || trimmed.startsWith("//");
+    if (!isUrlShaped && !REDIRECT_LIKE_PARAM_NAMES.test(key)) continue;
     if (looksLikeInternalTarget(value)) return key;
   }
   return null;
@@ -278,48 +321,69 @@ app.get("/", (req, res) => {
 app.post("/", async (req, res) => {
   const body = req.body || {};
   const { tool, arguments: args } = body;
+  let decision;
 
   if (tool === "read_file") {
     const p = args && args.path;
     if (typeof p !== "string" || p.length === 0) {
-      return res.json({ action: "block", reason: "invalid or missing path argument" });
+      decision = { action: "block", reason: "invalid or missing path argument" };
+    } else {
+      const resolved = safeResolveWithinSandbox(p);
+      if (!resolved) {
+        decision = { action: "block", reason: "path escapes the sandbox root" };
+      } else {
+        try {
+          const content = fs.readFileSync(resolved, "utf8");
+          decision = { action: "allow", reason: "path resolves within sandbox root", result: { content } };
+        } catch (e) {
+          decision = {
+            action: "allow",
+            reason: "path resolves within sandbox root",
+            result: { content: "", error: e.code || "read_error" },
+          };
+        }
+      }
     }
-    const resolved = safeResolveWithinSandbox(p);
-    if (!resolved) {
-      return res.json({ action: "block", reason: "path escapes the sandbox root" });
-    }
-    try {
-      const content = fs.readFileSync(resolved, "utf8");
-      return res.json({ action: "allow", reason: "path resolves within sandbox root", result: { content } });
-    } catch (e) {
-      return res.json({
-        action: "allow",
-        reason: "path resolves within sandbox root",
-        result: { content: "", error: e.code || "read_error" },
-      });
-    }
-  }
-
-  if (tool === "fetch_url") {
+  } else if (tool === "fetch_url") {
     const url = args && args.url;
     if (typeof url !== "string" || url.length === 0) {
-      return res.json({ action: "block", reason: "invalid or missing url argument" });
+      decision = { action: "block", reason: "invalid or missing url argument" };
+    } else {
+      const result = await safeFetch(url);
+      if (result.blocked) {
+        decision = { action: "block", reason: result.reason };
+      } else if (result.error) {
+        decision = { action: "allow", reason: "host in allowlist", result: { content: "", error: result.message } };
+      } else {
+        decision = { action: "allow", reason: "host in allowlist", result: { status: result.status, content: result.body } };
+      }
     }
-    const result = await safeFetch(url);
-    if (result.blocked) {
-      return res.json({ action: "block", reason: result.reason });
-    }
-    if (result.error) {
-      return res.json({ action: "allow", reason: "host in allowlist", result: { content: "", error: result.message } });
-    }
-    return res.json({
-      action: "allow",
-      reason: "host in allowlist",
-      result: { status: result.status, content: result.body },
-    });
+  } else {
+    decision = { action: "block", reason: "unknown tool" };
   }
 
-  return res.json({ action: "block", reason: "unknown tool" });
+  await captureRequest({ ts: new Date().toISOString(), tool, args, action: decision.action, reason: decision.reason });
+
+  res.json(decision);
+});
+
+app.get("/captured", async (req, res) => {
+  const expected = process.env.CAPTURE_SECRET;
+  const secret = req.query && req.query.secret;
+  if (!expected || typeof secret !== "string" || secret !== expected) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  const raw = (await redisCommand(["LRANGE", CAPTURE_KEY, "0", "99"])) || [];
+  const entries = raw
+    .map((e) => {
+      try {
+        return JSON.parse(e);
+      } catch (err) {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  res.json({ count: entries.length, entries });
 });
 
 // eslint-disable-next-line no-unused-vars

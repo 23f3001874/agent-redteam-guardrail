@@ -196,11 +196,13 @@ function looksLikeInternalTarget(rawValue) {
 }
 
 // Only these param names carry redirect/target semantics per the described
-// attack shape (?next=, ?redirect=, ?url=, ...). A bare IP/localhost-shaped
-// VALUE under an unrelated key (e.g. ?version=10.0.0.5, a version string that
-// happens to be numeric-quad-shaped) must not be treated as a target -- only
-// an actual wrapped URL (unambiguous regardless of key name) or a
-// redirect-sounding key name triggers the internal-target check.
+// attack shape (?next=, ?redirect=, ?url=, ...). A value that merely LOOKS
+// like a URL under an unrelated key (e.g. ?q=http://127.0.0.1/admin, a search
+// query whose text happens to contain a URL-shaped string) is not itself a
+// navigation/fetch target -- only a redirect-sounding key name means this
+// guardrail actually treats the value as somewhere the app will send a
+// request or a browser. Gating on the value's shape regardless of key name
+// over-blocks ordinary search/log/echo params that just contain URL text.
 const REDIRECT_LIKE_PARAM_NAMES = /^(next|redirect|redirect_uri|redirect_url|url|target|dest|destination|forward|goto|return|return_to|return_url|callback|continue|out|to|link)$/i;
 
 function findSuspiciousQueryParam(rawUrl) {
@@ -211,9 +213,7 @@ function findSuspiciousQueryParam(rawUrl) {
     return null;
   }
   for (const [key, value] of u.searchParams.entries()) {
-    const trimmed = typeof value === "string" ? value.trim() : "";
-    const isUrlShaped = /^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//.test(trimmed) || trimmed.startsWith("//");
-    if (!isUrlShaped && !REDIRECT_LIKE_PARAM_NAMES.test(key)) continue;
+    if (!REDIRECT_LIKE_PARAM_NAMES.test(key)) continue;
     if (looksLikeInternalTarget(value)) return key;
   }
   return null;

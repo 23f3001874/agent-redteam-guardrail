@@ -317,8 +317,11 @@ async function safeFetch(initialUrl, maxHops) {
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "agent-redteam-guardrail" });
 });
+app.get("/check", (req, res) => {
+  res.json({ ok: true, service: "agent-redteam-guardrail" });
+});
 
-app.post("/", async (req, res) => {
+app.post(["/", "/check"], async (req, res) => {
   const body = req.body || {};
   const { tool, arguments: args } = body;
   let decision;

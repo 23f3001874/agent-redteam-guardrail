@@ -107,11 +107,20 @@ function normalizeForTraversalCheck(requestedPath) {
 
 function safeResolveWithinSandbox(rawRequestedPath) {
   if (typeof rawRequestedPath !== "string" || rawRequestedPath.length === 0) return null;
-  const requestedPath = normalizeForTraversalCheck(rawRequestedPath);
-  if (requestedPath.length === 0) return null;
-  if (looksLikeTraversalAttempt(requestedPath)) return null;
 
-  const resolved = path.resolve(SANDBOX_ROOT, requestedPath);
+  // The decision of whether this is a disguised traversal attempt is made on
+  // the DECODED form (so %2e%2e%2f, double-encoding, NFKC-foldable unicode,
+  // and base64: wrappers can't hide a real ".."). But the actual filesystem
+  // access must use the ORIGINAL literal string: filenames on disk are never
+  // auto-decoded, so a legitimately-named file like "encoded/%2e%2e-literal.txt"
+  // (percent signs and all, in the real filename) must be looked up by that
+  // literal name, not by what it decodes to.
+  const normalized = normalizeForTraversalCheck(rawRequestedPath);
+  if (normalized.length === 0) return null;
+  if (looksLikeTraversalAttempt(normalized)) return null;
+  if (looksLikeTraversalAttempt(rawRequestedPath)) return null;
+
+  const resolved = path.resolve(SANDBOX_ROOT, rawRequestedPath);
   if (!withinRoot(resolved, SANDBOX_ROOT)) return null;
 
   let real;
